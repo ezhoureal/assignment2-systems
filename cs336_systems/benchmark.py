@@ -18,11 +18,11 @@ LARGE = ModelSize(d_model=1280, d_ff=5120, num_layers=36, num_heads=20)
 XL = ModelSize(d_model=1600, d_ff=6400, num_layers=48, num_heads=25)
 XXL = ModelSize(d_model=2560, d_ff=10240, num_layers=32, num_heads=32)
 
-W = 0
+W = 5
 CONTEXT_LENGTH = 512
 ROPE_THETA = 10000
-VOCAB_SIZE = 30512
-B = 32
+VOCAB_SIZE = 32768
+B = 4
 
 device = (
     torch.device("cuda") if torch.cuda.is_available() else
@@ -30,8 +30,15 @@ device = (
 )
 
 def benchmark(size: ModelSize, forward_only: bool, steps: int):
-    m = model.BasicsTransformerLM(vocab_size=VOCAB_SIZE, context_length=CONTEXT_LENGTH, d_model=size.d_model, num_layers=size.num_layers, num_heads=size.num_heads, d_ff=size.d_ff, rope_theta=ROPE_THETA)
-    random_batch = torch.randint(0, VOCAB_SIZE, (B, CONTEXT_LENGTH), dtype=torch.int32)
+    m = model.BasicsTransformerLM(vocab_size=VOCAB_SIZE, 
+                                  context_length=CONTEXT_LENGTH, 
+                                  d_model=size.d_model, 
+                                  num_layers=size.num_layers, 
+                                  num_heads=size.num_heads, 
+                                  d_ff=size.d_ff, 
+                                  rope_theta=ROPE_THETA
+                                  ).to(device)
+    random_batch = torch.randint(0, VOCAB_SIZE, (B, CONTEXT_LENGTH), dtype=torch.int32, device=device)
     stats: list[int] = []
     for i in range(W + steps):
         # warmup
