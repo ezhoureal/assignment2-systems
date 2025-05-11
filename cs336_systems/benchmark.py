@@ -22,7 +22,7 @@ W = 5
 CONTEXT_LENGTH = 512
 ROPE_THETA = 10000
 VOCAB_SIZE = 32768
-B = 4
+B = 1
 
 device = (
     torch.device("cuda") if torch.cuda.is_available() else
@@ -58,4 +58,4 @@ def benchmark(size: ModelSize, forward_only: bool, steps: int):
     std = (sum((x - avg) ** 2 for x in stats) / len(stats)) ** 0.5
     print(f'avg time = {avg:.3f} seconds, std = {std:.3f}')
 
-benchmark(SMALL, True, 1)
+benchmark(LARGE, False, 5)
