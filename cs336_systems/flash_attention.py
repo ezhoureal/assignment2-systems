@@ -26,9 +26,9 @@ class FlashAttentionPy(torch.autograd.Function):
                 attn = einops.einsum(q, k, "... b_q d, ... b_k d -> ... b_q b_k") * scale
                 block_row_max = torch.amax(attn, dim=-1)
                 new_m = torch.maximum(m, block_row_max)
-                attn = torch.exp(attn - m.unsqueeze(-1))
+                attn = torch.exp(attn - new_m.unsqueeze(-1))
                 assert new_m.shape == m.shape, new_m.shape
-                m_diff = torch.exp(new_m - m)
+                m_diff = torch.exp(m - new_m)
                 l.mul_(m_diff)
                 l.add_(torch.sum(attn, dim=-1))
                 m.copy_(new_m)
@@ -37,7 +37,6 @@ class FlashAttentionPy(torch.autograd.Function):
             o.div_(l.unsqueeze(-1))
             l.copy_(m + torch.log(l))
 
-        print(f'O = {O}, L = {L}')
         ctx.save_for_backward(L)
         return O
 
