@@ -83,7 +83,7 @@ def flash_attn_kernel(
     q = tl.load(q_block_ptr)
     o = tl.load(o_block_ptr)
     l = tl.load(l_block_ptr)
-    m = tl.full((TILE_SIZE,), float('-inf'), dtype=tl.float32)
+    m = tl.full((1, TILE_SIZE,), float('-inf'), dtype=tl.float32)
     for col_tile_idx in range(0, N // TILE_SIZE):
         k_block_ptr = tl.make_block_ptr(
             k_ptr,
@@ -103,19 +103,18 @@ def flash_attn_kernel(
         )
         k = tl.load(k_block_ptr)
         v = tl.load(v_block_ptr)
-
         attn = tl.dot(q, tl.trans(k, 0, 2, 1)) * (D ** -0.5)
-        block_row_max = tl.max(attn, axis=1)
+        block_row_max = tl.max(attn, axis=2)
         new_m = tl.maximum(m, block_row_max)
         attn = tl.exp(attn - new_m[:, None])
         m_diff = tl.exp(m - new_m)
         l *= m_diff
-        l += tl.sum(attn, axis=1)
+        l += tl.sum(attn, axis=2)
         m = new_m
-        o *= m_diff[:, None]
+        o *= m_diff[:, :, None]
         o += tl.dot(attn, v)
     
-    tl.store(o_block_ptr, o / l[:, None])
+    tl.store(o_block_ptr, o / l[:, :, None])
     tl.store(l_block_ptr, m + tl.log(l))
 
 class FlashAttentionTriton(torch.autograd.Function):
