@@ -103,7 +103,8 @@ def flash_attn_kernel(
         )
         k = tl.load(k_block_ptr)
         v = tl.load(v_block_ptr)
-        attn = tl.dot(q, tl.trans(k, 0, 2, 1)) * (D ** -0.5)
+        attn = tl.dot(q, tl.trans(k, 0, 2, 1)) * (D ** -0.5) # ... b_q d, ... b_k d -> ... b_q b_k
+        attn = 1
         block_row_max = tl.max(attn, axis=2)
         new_m = tl.maximum(m, block_row_max)
         attn = tl.exp(attn - new_m[:, None])
@@ -112,7 +113,7 @@ def flash_attn_kernel(
         l += tl.sum(attn, axis=2)
         m = new_m
         o *= m_diff[:, :, None]
-        o += tl.dot(attn, v)
+        o += tl.dot(attn, v) # ... b_q b_k, ... b_k d -> ... b_q d
     
     tl.store(o_block_ptr, o / l[:, :, None])
     tl.store(l_block_ptr, m + tl.log(l))
