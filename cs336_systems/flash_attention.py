@@ -1,10 +1,11 @@
 import torch
 import einops
 
+TILE_SIZE = 16
+
 class FlashAttentionPy(torch.autograd.Function):
     def forward(ctx, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, is_causal=False):
         DEVICE = Q.device
-        TILE_SIZE = 16
         num_tiles = Q.shape[-2] // TILE_SIZE
         scale = Q.shape[-1] ** -0.5
         assert Q.shape == K.shape
@@ -40,5 +41,14 @@ class FlashAttentionPy(torch.autograd.Function):
         ctx.save_for_backward(L)
         return O
 
+import triton
+import triton.language as tl
 
+@triton.jit
+def flash_fwd(
+    q_ptr, k_ptr, v_ptr, o_ptr, l_ptr, m_ptr,
+    TILE_SIZE: tl.constexpr
+):
+    row_tile_idx = tl.program_id(0)
+    q_block_ptr = tl.make
 
