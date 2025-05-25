@@ -39,7 +39,7 @@ def benchmark(size: ModelSize, forward_only: bool, steps: int):
                                   rope_theta=ROPE_THETA
                                   ).to(device)
     random_batch = torch.randint(0, VOCAB_SIZE, (B, CONTEXT_LENGTH), dtype=torch.int32, device=device)
-    stats: list[int] = []
+    stats: list[float] = []
     for i in range(W + steps):
         # warmup
         start_time = time.time()
