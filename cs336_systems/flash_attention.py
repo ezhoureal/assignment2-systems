@@ -80,10 +80,10 @@ def flash_attn_kernel(
         block_shape=(1, TILE_SIZE,),
         order=(1, 0,)
     )
-    q = tl.load(q_block_ptr)
-    o = tl.load(o_block_ptr)
-    l = tl.load(l_block_ptr)
-    m = tl.full((1, TILE_SIZE,), float('-inf'), dtype=tl.float32)
+    q = tl.load(q_block_ptr).reshape(TILE_SIZE, D)
+    o = tl.load(o_block_ptr).reshape(TILE_SIZE, D)
+    l = tl.load(l_block_ptr).reshape(TILE_SIZE)
+    m = tl.full((TILE_SIZE,), float('-inf'), dtype=tl.float32)
     for col_tile_idx in range(0, N // TILE_SIZE):
         k_block_ptr = tl.make_block_ptr(
             k_ptr,
@@ -101,22 +101,24 @@ def flash_attn_kernel(
             block_shape=(1, TILE_SIZE, D),
             order=(2, 1, 0,)
         )
-        k = tl.load(k_block_ptr)
-        v = tl.load(v_block_ptr)
-        attn = tl.dot(q, tl.trans(k, 0, 2, 1)) * (D ** -0.5) # ... b_q d, ... b_k d -> ... b_q b_k
-        attn = 1
-        block_row_max = tl.max(attn, axis=2)
+        k = tl.load(k_block_ptr).reshape(TILE_SIZE, D)
+        v = tl.load(v_block_ptr).reshape(TILE_SIZE, D)
+        attn = tl.dot(q, tl.permute(k, (1, 0))) * (D ** -0.5) # n d, n d -> n n
+        block_row_max = tl.max(attn, axis=1)
         new_m = tl.maximum(m, block_row_max)
         attn = tl.exp(attn - new_m[:, None])
         m_diff = tl.exp(m - new_m)
         l *= m_diff
-        l += tl.sum(attn, axis=2)
+        l += tl.sum(attn, axis=1)
         m = new_m
-        o *= m_diff[:, :, None]
-        o += tl.dot(attn, v) # ... b_q b_k, ... b_k d -> ... b_q d
-    
-    tl.store(o_block_ptr, o / l[:, :, None])
-    tl.store(l_block_ptr, m + tl.log(l))
+        o *= m_diff[:, None]
+        o += tl.dot(attn, v) # n n, n d -> n d
+    # tl.device_print("sss", o)
+    o /= l[:, None]
+    l = m + tl.log(l)
+    o_orig = o.view(1, TILE_SIZE, D)
+    tl.store(o_block_ptr, o_orig)
+    # tl.store(l_block_ptr, l.reshape(1, TILE_SIZE))
 
 class FlashAttentionTriton(torch.autograd.Function):
     @staticmethod
