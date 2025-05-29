@@ -35,13 +35,16 @@ def run_model(rank, world_size, data):
         loss.backward()
 
         com_start_time = time.time()
-        for param in model.parameters():
-            if param.grad is not None:
-                dist.all_reduce(param.grad.data)
+        grads = [param.grad.data for param in model.parameters() if param.grad is not None]
+        flattened_grads = torch._utils._flatten_dense_tensors(grads)
+        dist.all_reduce(flattened_grads)
+        unflatted_grads = torch._utils._unflatten_dense_tensors(flattened_grads, grads)
+        for grad, unflat_grad in zip(grads, unflatted_grads):
+            grad.copy_(unflat_grad)
         communication_time += time.time() - com_start_time
 
         optimizer.step()
-        
+
         total_time += time.time() - start_time
     if rank == 0:
         print(f'total time = {total_time}, communication time = {communication_time}')

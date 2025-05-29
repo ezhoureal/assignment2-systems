@@ -31,3 +31,5 @@ All experiments ran with BatchSize = 1 on my RTX 3070
 step = 5, model = LLM, world_size = 4, sequence_length = 20, B = 1 (for each worker)
 
 total time = 0.5839047431945801, communication time = 0.26487088203430176
+
+with batched communication (flatten_dense_tensors), communication time shrunk to 0.14197254180908203 (~50% decrease)
