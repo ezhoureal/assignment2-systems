@@ -20,13 +20,16 @@ def setup(rank, world_size):
 
 def run_model(rank, world_size, data):
     setup(rank, world_size)
-    model = DDP(BasicsTransformerLM(VOCAB, CTX_LEN, D_MODEL, LAYERS, NUM_HEADS, D_FF, ROPE_THETA))
+    model = BasicsTransformerLM(VOCAB, CTX_LEN, D_MODEL, LAYERS, NUM_HEADS, D_FF, ROPE_THETA)
     optimizer = torch.optim.AdamW(model.parameters())
     res = model.forward(data[rank:rank + 1, :])
     lossFunc = torch.nn.MSELoss()
     loss = lossFunc(res, torch.zeros_like(res))
     optimizer.zero_grad()
     loss.backward()
+    for param in model.parameters():
+        if param.grad is not None:
+            dist.all_reduce(param.grad.data)
     optimizer.step()
 
 if __name__ == "__main__":
