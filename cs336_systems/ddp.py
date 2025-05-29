@@ -13,6 +13,7 @@ LAYERS=6
 NUM_HEADS=4
 D_FF=384
 ROPE_THETA=10000
+STEPS=5
 def setup(rank, world_size):
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "2044"
@@ -22,15 +23,28 @@ def run_model(rank, world_size, data):
     setup(rank, world_size)
     model = BasicsTransformerLM(VOCAB, CTX_LEN, D_MODEL, LAYERS, NUM_HEADS, D_FF, ROPE_THETA)
     optimizer = torch.optim.AdamW(model.parameters())
-    res = model.forward(data[rank:rank + 1, :])
-    lossFunc = torch.nn.MSELoss()
-    loss = lossFunc(res, torch.zeros_like(res))
-    optimizer.zero_grad()
-    loss.backward()
-    for param in model.parameters():
-        if param.grad is not None:
-            dist.all_reduce(param.grad.data)
-    optimizer.step()
+    communication_time = 0.0
+    total_time = 0.0
+    for step in range(STEPS):
+        start_time = time.time()
+
+        res = model.forward(data[rank:rank + 1, :])
+        lossFunc = torch.nn.MSELoss()
+        loss = lossFunc(res, torch.zeros_like(res))
+        optimizer.zero_grad()
+        loss.backward()
+
+        com_start_time = time.time()
+        for param in model.parameters():
+            if param.grad is not None:
+                dist.all_reduce(param.grad.data)
+        communication_time += time.time() - com_start_time
+
+        optimizer.step()
+        
+        total_time += time.time() - start_time
+    if rank == 0:
+        print(f'total time = {total_time}, communication time = {communication_time}')
 
 if __name__ == "__main__":
     world_size = 4

@@ -26,3 +26,8 @@ All experiments ran with BatchSize = 1 on my RTX 3070
 | 10MB      | 0.0116s     |
 | 100MB     | 0.0686s     |
 | 1GB       | 0.847s      |
+
+### naive_ddp
+step = 5, model = LLM, world_size = 4, sequence_length = 20, B = 1 (for each worker)
+
+total time = 0.5839047431945801, communication time = 0.26487088203430176
