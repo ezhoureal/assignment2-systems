@@ -54,93 +54,97 @@ def flash_attn_kernel(
     TILE_SIZE: tl.constexpr,
     D: tl.constexpr
 ):
-    row_tile_idx = tl.program_id(0)
+    # Parallelize over rows in batches
+    row_idx = tl.program_id(0) * TILE_SIZE + tl.arange(0, TILE_SIZE)
     b_idx = tl.program_id(1)
-    q_block_ptr = tl.make_block_ptr(
-        q_ptr,
-        (B, N, D),
-        (q_stride_batch, q_stride_n, q_stride_d),
-        offsets=(b_idx, row_tile_idx * TILE_SIZE, 0),
-        block_shape=(1, TILE_SIZE, D),
-        order=(2, 1, 0,)
-    )
-    o_block_ptr = tl.make_block_ptr(
-        o_ptr,
-        (B, N, D),
-        (q_stride_batch, q_stride_n, q_stride_d),
-        offsets=(b_idx, row_tile_idx * TILE_SIZE, 0),
-        block_shape=(1, TILE_SIZE, D),
-        order=(2, 1, 0,)
-    )
-    l_block_ptr = tl.make_block_ptr(
-        l_ptr,
-        (B, N),
-        (l_stride_batch, l_stride_n,),
-        offsets=(b_idx, row_tile_idx * TILE_SIZE,),
-        block_shape=(1, TILE_SIZE,),
-        order=(1, 0,)
-    )
-    q = tl.load(q_block_ptr).reshape(TILE_SIZE, D)
-    o = tl.load(o_block_ptr).reshape(TILE_SIZE, D)
-    l = tl.load(l_block_ptr).reshape(TILE_SIZE)
+    
+    # Separate indices for sequence and feature dimensions
+    seq_idx = tl.arange(0, TILE_SIZE)  # For sequence dimension
+    feat_idx = tl.arange(0, D)         # For feature dimension
+    
+    # Calculate batch offsets
+    q_batch_offset = b_idx * q_stride_batch
+    k_batch_offset = b_idx * q_stride_batch
+    v_batch_offset = b_idx * q_stride_batch
+    o_batch_offset = b_idx * q_stride_batch
+    l_batch_offset = b_idx * l_stride_batch
+    
+    # Initialize accumulators
     m = tl.full((TILE_SIZE,), float('-inf'), dtype=tl.float32)
-    for col_tile_idx in range(0, N // TILE_SIZE):
-        k_block_ptr = tl.make_block_ptr(
-            k_ptr,
-            (B, N, D),
-            (q_stride_batch, q_stride_n, q_stride_d),
-            offsets=(b_idx, col_tile_idx * TILE_SIZE, 0),
-            block_shape=(1, TILE_SIZE, D),
-            order=(2, 1, 0,)
-        )
-        v_block_ptr = tl.make_block_ptr(
-            v_ptr,
-            (B, N, D),
-            (q_stride_batch, q_stride_n, q_stride_d),
-            offsets=(b_idx, col_tile_idx * TILE_SIZE, 0),
-            block_shape=(1, TILE_SIZE, D),
-            order=(2, 1, 0,)
-        )
-        k = tl.load(k_block_ptr).reshape(TILE_SIZE, D)
-        v = tl.load(v_block_ptr).reshape(TILE_SIZE, D)
-        attn = tl.dot(q, tl.permute(k, (1, 0))) * (D ** -0.5) # n d, n d -> n n
-        block_row_max = tl.max(attn, axis=1)
-        new_m = tl.maximum(m, block_row_max)
-        attn = tl.exp(attn - new_m[:, None])
-        m_diff = tl.exp(m - new_m)
-        l *= m_diff
-        l += tl.sum(attn, axis=1)
+    l_accum = tl.zeros((TILE_SIZE,), dtype=tl.float32)
+    o = tl.zeros((TILE_SIZE, D), dtype=tl.float32)
+    
+    # Load query tile - shape (TILE_SIZE, D)
+    q_offsets = q_batch_offset + row_idx[:, None] * q_stride_n + feat_idx[None, :] * q_stride_d
+    q_mask = (row_idx < N)[:, None] & (feat_idx < D)[None, :]
+    q = tl.load(q_ptr + q_offsets, mask=q_mask, other=0.0)
+    
+    # Loop over key/value tiles
+    num_tiles = tl.cdiv(N, TILE_SIZE)
+    for tile_idx in range(num_tiles):
+        # Calculate column indices for this tile
+        col_start = tile_idx * TILE_SIZE
+        col_indices = col_start + seq_idx
+        
+        # Load key tile - shape (TILE_SIZE, D)
+        k_offsets = k_batch_offset + col_indices[:, None] * q_stride_n + feat_idx[None, :] * q_stride_d
+        k_mask = (col_indices < N)[:, None] & (feat_idx < D)[None, :]
+        k = tl.load(k_ptr + k_offsets, mask=k_mask, other=0.0)
+        
+        # Load value tile - shape (TILE_SIZE, D)
+        v_offsets = v_batch_offset + col_indices[:, None] * q_stride_n + feat_idx[None, :] * q_stride_d
+        v_mask = (col_indices < N)[:, None] & (feat_idx < D)[None, :]
+        v = tl.load(v_ptr + v_offsets, mask=v_mask, other=0.0)
+        
+        # Compute attention scores - shape (TILE_SIZE, TILE_SIZE)
+        attn = tl.dot(q, tl.trans(k)) * (D ** -0.5)
+        
+        # Update with numerical stability
+        row_max = tl.max(attn, axis=1)
+        new_m = tl.maximum(m, row_max)
+        exp_attn = tl.exp(attn - new_m[:, None])
+        exp_m_diff = tl.exp(m - new_m)
+        
+        # Update accumulators
+        l_accum = l_accum * exp_m_diff + tl.sum(exp_attn, axis=1)
+        o = o * exp_m_diff[:, None] + tl.dot(exp_attn, v)  # Now shapes match
         m = new_m
-        o *= m_diff[:, None]
-        o += tl.dot(attn, v) # n n, n d -> n d
-    # tl.device_print("sss", o)
-    o /= l[:, None]
-    l = m + tl.log(l)
-    o_orig = o.view(1, TILE_SIZE, D)
-    tl.store(o_block_ptr, o_orig)
-    # tl.store(l_block_ptr, l.reshape(1, TILE_SIZE))
+    
+    # Normalize output
+    EPSILON = 1e-6
+    o = o / (l_accum[:, None] + EPSILON)
+    
+    # Store output
+    o_offsets = o_batch_offset + row_idx[:, None] * q_stride_n + feat_idx[None, :] * q_stride_d
+    o_mask = (row_idx < N)[:, None] & (feat_idx < D)[None, :]
+    tl.store(o_ptr + o_offsets, o, mask=o_mask)
+    
+    # Store log-sum-exp
+    l_offsets = l_batch_offset + row_idx * l_stride_n
+    l_mask = row_idx < N
+    tl.store(l_ptr + l_offsets, m + tl.log(l_accum), mask=l_mask)
 
 class FlashAttentionTriton(torch.autograd.Function):
     @staticmethod
     def forward(ctx, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, is_causal=False):
         DEVICE = Q.device
         B, N, D = Q.shape
-        assert Q.shape == K.shape
-        assert Q.shape == V.shape
-        assert Q.is_cuda and K.is_cuda and V.is_cuda, "FlashAttentionTriton only supports CUDA tensors"
-        assert Q.shape[-2] % TILE_SIZE == 0, "The second last dimension of Q must be divisible by TILE_SIZE"
-        assert K.shape[-2] % TILE_SIZE == 0, "The second last dimension of K must be divisible by TILE_SIZE"
-        assert V.shape[-2] % TILE_SIZE == 0, "The second last dimension of V must be divisible by TILE_SIZE"
-        O = torch.zeros_like(Q)
-        L = torch.zeros((B, N), device=DEVICE)
-        flash_attn_kernel[(N // TILE_SIZE, B)](
+        
+        # Initialize output and LSE buffers
+        O = torch.empty_like(Q)
+        L = torch.empty((B, N), device=DEVICE, dtype=torch.float32)
+        
+        # Calculate grid size
+        grid = (triton.cdiv(N, TILE_SIZE), B)
+        
+        flash_attn_kernel[grid](
             Q, K, V, O, L,
             Q.stride(0), Q.stride(1), Q.stride(2),
             L.stride(0), L.stride(1),
             B, N,
-            TILE_SIZE, # type: ignore
-            D # type: ignore
+            TILE_SIZE=TILE_SIZE, # type: ignore
+            D=D # type: ignore
         )
         
-        ctx.save_for_backward(L)
+        ctx.save_for_backward(Q, K, V, O, L)
         return O
