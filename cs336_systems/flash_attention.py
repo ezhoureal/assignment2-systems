@@ -50,7 +50,7 @@ def flash_attn_kernel(
     q_ptr, k_ptr, v_ptr, o_ptr, l_ptr,
     q_stride_batch, q_stride_n, q_stride_d, 
     l_stride_batch, l_stride_n,
-    B, N,
+    N,
     TILE_SIZE: tl.constexpr,
     D: tl.constexpr
 ):
@@ -64,9 +64,6 @@ def flash_attn_kernel(
     
     # Calculate batch offsets
     q_batch_offset = b_idx * q_stride_batch
-    k_batch_offset = b_idx * q_stride_batch
-    v_batch_offset = b_idx * q_stride_batch
-    o_batch_offset = b_idx * q_stride_batch
     l_batch_offset = b_idx * l_stride_batch
     
     # Initialize accumulators
@@ -86,15 +83,11 @@ def flash_attn_kernel(
         col_start = tile_idx * TILE_SIZE
         col_indices = col_start + seq_idx
         
-        # Load key tile - shape (TILE_SIZE, D)
-        k_offsets = k_batch_offset + col_indices[:, None] * q_stride_n + feat_idx[None, :] * q_stride_d
+        # Load key & value tile - shape (TILE_SIZE, D)
+        k_offsets = q_batch_offset + col_indices[:, None] * q_stride_n + feat_idx[None, :] * q_stride_d
         k_mask = (col_indices < N)[:, None] & (feat_idx < D)[None, :]
         k = tl.load(k_ptr + k_offsets, mask=k_mask, other=0.0)
-        
-        # Load value tile - shape (TILE_SIZE, D)
-        v_offsets = v_batch_offset + col_indices[:, None] * q_stride_n + feat_idx[None, :] * q_stride_d
-        v_mask = (col_indices < N)[:, None] & (feat_idx < D)[None, :]
-        v = tl.load(v_ptr + v_offsets, mask=v_mask, other=0.0)
+        v = tl.load(v_ptr + k_offsets, mask=k_mask, other=0.0)
         
         # Compute attention scores - shape (TILE_SIZE, TILE_SIZE)
         attn = tl.dot(q, tl.trans(k)) * (D ** -0.5)
@@ -115,9 +108,7 @@ def flash_attn_kernel(
     o = o / (l_accum[:, None] + EPSILON)
     
     # Store output
-    o_offsets = o_batch_offset + row_idx[:, None] * q_stride_n + feat_idx[None, :] * q_stride_d
-    o_mask = (row_idx < N)[:, None] & (feat_idx < D)[None, :]
-    tl.store(o_ptr + o_offsets, o, mask=o_mask)
+    tl.store(o_ptr + q_offsets, o, mask=q_mask)
     
     # Store log-sum-exp
     l_offsets = l_batch_offset + row_idx * l_stride_n
@@ -141,7 +132,7 @@ class FlashAttentionTriton(torch.autograd.Function):
             Q, K, V, O, L,
             Q.stride(0), Q.stride(1), Q.stride(2),
             L.stride(0), L.stride(1),
-            B, N,
+            N,
             TILE_SIZE=TILE_SIZE, # type: ignore
             D=D # type: ignore
         )
