@@ -50,34 +50,33 @@ def run_model(rank, world_size, data):
         print(f'total time = {total_time}, communication time = {communication_time}')
 
 class DDPWrapper(torch.nn.Module):
-
     def __init__(self, module: torch.nn.Module):
         super().__init__()
         self.module = module
-        self.handles = []
-        for param in module.parameters():
+        
+        # Initialize parameters (broadcast from rank 0)
+        for param in self.module.parameters():
             dist.broadcast(param.data, src=0, async_op=False)
-
-        def grad_hook(grad):
-            grad /= dist.get_world_size()
-            handle = dist.all_reduce(grad, op=dist.ReduceOp.SUM, async_op=False)
-            self.handles.append(handle)
-
-        for param in module.parameters():
-            if param.requires_grad:
-                param.register_post_accumulate_grad_hook(grad_hook)
-
-
+    
     def forward(self, *inputs, **kwargs):
+        output = self.module(*inputs, **kwargs)
+        # Synchronize buffers after forward
         for buffer in self.module.buffers():
             dist.broadcast(buffer.data, src=0, async_op=False)
-        return self.module.forward(*inputs, **kwargs)
-    
+        return output
+
     def finish_gradient_synchronization(self):
-        print(f'handle count = {self.handles.__len__()}')
-        for handle in self.handles:
+        """Call after backward pass (or after gradient accumulation)."""
+        handles = []
+        for param in self.module.parameters():
+            if param.requires_grad and param.grad is not None:
+                # Average gradients across workers
+                param.grad /= dist.get_world_size()
+                handle = dist.all_reduce(param.grad, op=dist.ReduceOp.SUM, async_op=True)
+                handles.append(handle)
+        
+        for handle in handles:
             handle.wait()
-        self.handles.clear()
 
 if __name__ == "__main__":
     world_size = 4
