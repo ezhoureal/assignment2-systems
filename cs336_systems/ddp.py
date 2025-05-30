@@ -59,8 +59,8 @@ class DDPWrapper(torch.nn.Module):
             dist.broadcast(param.data, src=0, async_op=False)
 
         def grad_hook(grad):
-            print(f'hook')
-            handle = dist.all_reduce(grad, op=dist.ReduceOp.AVG, async_op=False)
+            grad /= dist.get_world_size()
+            handle = dist.all_reduce(grad, op=dist.ReduceOp.SUM, async_op=False)
             self.handles.append(handle)
 
         for param in module.parameters():
