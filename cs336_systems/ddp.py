@@ -49,6 +49,32 @@ def run_model(rank, world_size, data):
     if rank == 0:
         print(f'total time = {total_time}, communication time = {communication_time}')
 
+class DDPWrapper(torch.nn.Module):
+    def __init__(self, module: torch.nn.Module):
+        super().__init__()
+        self.module = module
+        self.handles = []
+        for param in module.parameters():
+            dist.broadcast(param.data, src=0, async_op=False)
+        # for buffer in module.buffers():
+        #     dist.broadcast(buffer.data, src=0, async_op=False)
+        for param in module.parameters():
+            if param.grad is not None:
+                param.register_post_accumulate_grad_hook(self.grad_hook)
+
+    def grad_hook(self, grad):
+        handle = dist.all_reduce(grad, op=dist.ReduceOp.AVG, async_op=True)
+        self.handles.append(handle)
+        return grad
+
+    def forward(self, *inputs, **kwargs):
+        return self.module.forward(*inputs, **kwargs)
+    
+    def finish_gradient_synchronization(self):
+        for handle in self.handles:
+            handle.wait()
+        self.handles.clear()
+
 if __name__ == "__main__":
     world_size = 4
     data = torch.randint(0, VOCAB, (4, CTX_LEN))
