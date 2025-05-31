@@ -39,8 +39,26 @@ class FlashAttentionPy(torch.autograd.Function):
             o.div_(l.unsqueeze(-1))
             l.copy_(m + torch.log(l))
 
-        ctx.save_for_backward(L)
+        ctx.save_for_backward(Q, K, V, O, L)
         return O
+
+    @staticmethod
+    def backward(ctx, grad_outputs):
+        print(f'grad shape = {grad_outputs.shape}')
+        dO = grad_outputs
+        Q, K, V, O, L = ctx.saved_tensors
+        D = torch.sum(dO * O, dim=-1, keepdim=True) # (... b_q d)
+        scale = Q.shape[-1] ** -0.5
+        S = einops.einsum(Q, K, "... b_q d, ... b_k d -> ... b_q b_k") * scale
+        P = torch.exp(S - L.unsqueeze(-1))
+        assert P.shape == S.shape
+        dV = einops.einsum(P, dO, "... b_q b_k, ... b_q d -> ... b_k d")
+        dP = einops.einsum(dO, V, "... b_q d, ... b_k d -> ... b_q b_k")
+        dS = P * (dP - D)
+        assert dS.shape == S.shape, f"dS shape mismatch: {dS.shape} != {S.shape}"
+        dQ = einops.einsum(dS, K, "... b_q b_k, ... b_k d -> ... b_q d") * scale
+        dK = einops.einsum(dS, Q, "... b_q b_k, ... b_q d -> ... b_k d") * scale
+        return dQ, dK, dV, None
 
 import triton
 import triton.language as tl
