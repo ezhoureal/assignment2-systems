@@ -136,6 +136,56 @@ def flash_attn_kernel(
     l_mask = row_idx < N
     tl.store(l_ptr + l_offsets, m + tl.log(l_accum), mask=l_mask)
 
+@triton.jit
+def flash_attn_backward_kernel(
+    q_ptr, k_ptr, v_ptr, o_ptr, l_ptr, d_ptr,
+    dO_ptr, dQ_ptr, dK_ptr, dV_ptr,
+    q_stride_batch, q_stride_n,
+    l_stride_batch,
+    N,
+    TILE_SIZE: tl.constexpr,
+    FEATURE_SIZE: tl.constexpr,
+    causal: tl.constexpr
+):
+    col_indices = tl.program_id(0) * TILE_SIZE + tl.arange(0, TILE_SIZE)
+    feature_indices = tl.arange(0, FEATURE_SIZE)
+    batch_idx = tl.program_id(1)
+    batch_offset = batch_idx * q_stride_batch
+
+    k_mask = (col_indices < N)[:, None] & (feature_indices < FEATURE_SIZE)[None, :]
+    k_offset = batch_offset + col_indices[:, None] * q_stride_n + feature_indices[None, :] # 2d matrix of offsets
+    k = tl.load(k_ptr + k_offset, k_mask, other=0.0)
+    v = tl.load(v_ptr + k_offset, k_mask, other=0.0)
+
+    dK = tl.zeros_like(k)
+    dV = tl.zeros_like(k)
+    for i in range(tl.cdiv(N, TILE_SIZE)):
+        row_indices = i * TILE_SIZE + tl.arange(0, TILE_SIZE)
+        q_mask = (row_indices < N)[:, None] & (feature_indices < FEATURE_SIZE)[None, :]
+        q_offset = batch_offset + row_indices[:, None] * q_stride_n + feature_indices[None, :]
+        q = tl.load(q_ptr + q_offset, q_mask, other=0.0)
+        dO = tl.load(dO_ptr + q_offset, q_mask, other=0.0)
+        L_offset = batch_idx * l_stride_batch + row_indices
+        L = tl.load(l_ptr + L_offset, mask=row_indices < N, other=0.0)
+        D = tl.load(d_ptr + L_offset, mask=row_indices < N, other=0.0)
+
+        S = tl.dot(q, tl.trans(k)) * (FEATURE_SIZE ** -0.5)
+        if causal:
+            S = tl.where(row_indices[:, None] >= col_indices[None, :], S, float(-1e6))
+        P = tl.exp(S - L[:, None])
+        dV += tl.dot(tl.trans(P), dO)
+        dP = tl.dot(dO, tl.trans(v)) # B_q B_k
+        dS = P * (dP - D[:, None]) * (FEATURE_SIZE ** -0.5)
+
+        dQ_inc = tl.dot(dS, k)
+        tl.atomic_add(dQ_ptr + q_offset, dQ_inc, mask=q_mask)
+
+        dK += tl.dot(tl.trans(dS), q)
+
+    tl.store(dK_ptr + k_offset, dK)
+    tl.store(dV_ptr + k_offset, dV)
+    
+
 class FlashAttentionTriton(torch.autograd.Function):
     @staticmethod
     def forward(ctx, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, is_causal=False):
@@ -161,3 +211,29 @@ class FlashAttentionTriton(torch.autograd.Function):
         
         ctx.save_for_backward(Q, K, V, O, L)
         return O
+
+    @staticmethod
+    def backward(ctx, grad_outputs):
+        dO = grad_outputs
+        Q, K, V, O, L = ctx.saved_tensors
+        B, N, feature_size = Q.shape
+        D = torch.sum(dO * O, dim=-1)
+        assert D.shape == (B, N)
+        grid = (triton.cdiv(N, TILE_SIZE), B)
+
+        # outputs
+        dQ = torch.zeros_like(Q)
+        dK = torch.empty_like(K)
+        dV = torch.empty_like(V)
+        flash_attn_backward_kernel[grid](
+            Q, K, V, O, L, D,
+            dO, dQ, dK, dV,
+            Q.stride(0), Q.stride(1),
+            L.stride(0),
+            N,
+            TILE_SIZE=TILE_SIZE, # type: ignore
+            FEATURE_SIZE=feature_size, # type: ignore
+            causal=False # type: ignore
+        )
+        return dQ, dK, dV, None
+        
