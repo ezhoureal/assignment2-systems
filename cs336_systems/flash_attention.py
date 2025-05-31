@@ -52,7 +52,8 @@ def flash_attn_kernel(
     l_stride_batch, l_stride_n,
     N,
     TILE_SIZE: tl.constexpr,
-    D: tl.constexpr
+    D: tl.constexpr,
+    causal: tl.constexpr
 ):
     # Parallelize over rows in batches
     row_idx = tl.program_id(0) * TILE_SIZE + tl.arange(0, TILE_SIZE)
@@ -91,6 +92,8 @@ def flash_attn_kernel(
         
         # Compute attention scores - shape (TILE_SIZE, TILE_SIZE)
         attn = tl.dot(q, tl.trans(k)) * (D ** -0.5)
+        if causal:
+            attn = tl.where(row_idx[:, None] >= col_indices[None, :], attn, float(-1e6))
         
         # Update with numerical stability
         row_max = tl.max(attn, axis=1)
@@ -134,7 +137,8 @@ class FlashAttentionTriton(torch.autograd.Function):
             L.stride(0), L.stride(1),
             N,
             TILE_SIZE=TILE_SIZE, # type: ignore
-            D=D # type: ignore
+            D=D, # type: ignore
+            causal=is_causal # type: ignore
         )
         
         ctx.save_for_backward(Q, K, V, O, L)
