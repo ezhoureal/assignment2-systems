@@ -210,6 +210,7 @@ class FlashAttentionTriton(torch.autograd.Function):
         )
         
         ctx.save_for_backward(Q, K, V, O, L)
+        ctx.is_causal = is_causal
         return O
 
     @staticmethod
@@ -233,7 +234,7 @@ class FlashAttentionTriton(torch.autograd.Function):
             N,
             TILE_SIZE=TILE_SIZE, # type: ignore
             FEATURE_SIZE=feature_size, # type: ignore
-            causal=False # type: ignore
+            causal=ctx.is_causal # type: ignore
         )
         return dQ, dK, dV, None
         
