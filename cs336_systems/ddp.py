@@ -75,14 +75,26 @@ class ParamBucket:
     def handle_grad_hook(self, param):
         self.back_propped += 1
         if self.back_propped == len(self.params):
-            for param in self.params:
-                # Average gradients across workers
-                param.grad /= dist.get_world_size()
-                self.handle = dist.all_reduce(param.grad, op=dist.ReduceOp.SUM, async_op=True)
+            # Flatten and concatenate all gradients
+            grads = [p.grad for p in self.params]
+            flattened_grads = torch._utils._flatten_dense_tensors(grads)
+            
+            # Average gradients across workers
+            flattened_grads /= dist.get_world_size()
+            
+            # Batch all_reduce
+            self.handle = dist.all_reduce(flattened_grads, op=dist.ReduceOp.SUM, async_op=True)
+            
+            # Store flattened grads to unflatten after sync
+            self.flattened_grads = flattened_grads
     
     def wait_for_grad_sync(self):
         if self.handle is not None:
             self.handle.wait()
+            # Unflatten gradients back to individual parameters
+            unflattened_grads = torch._utils._unflatten_dense_tensors(self.flattened_grads, [p.grad for p in self.params])
+            for param, grad in zip(self.params, unflattened_grads):
+                param.grad.copy_(grad)
 
 class DDPWrapper(torch.nn.Module):
     def __init__(self, module: torch.nn.Module, bucket_size_byte: int = 4):
