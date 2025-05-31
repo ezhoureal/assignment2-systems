@@ -49,26 +49,73 @@ def run_model(rank, world_size, data):
     if rank == 0:
         print(f'total time = {total_time}, communication time = {communication_time}')
 
+class ParamBucket:
+    def __init__(self, max_size: int):
+        self.params = []
+        self.max_size = max_size
+        self.cur_size = 0
+        self.back_propped = 0
+        self.handle = None
+
+    def add_param(self, param):
+        assert param.requires_grad, param
+        self.params.append(param)
+        self.cur_size += param.numel() * param.element_size()
+
+    def is_full(self):
+        return self.cur_size >= self.max_size
+    
+    def is_empty(self):
+        return self.cur_size > 0
+    
+    def prepare_back_prop(self):
+        self.back_propped = 0
+        self.handle = None
+    
+    def handle_grad_hook(self, param):
+        self.back_propped += 1
+        if self.back_propped == len(self.params):
+            for param in self.params:
+                # Average gradients across workers
+                param.grad /= dist.get_world_size()
+                self.handle = dist.all_reduce(param.grad, op=dist.ReduceOp.SUM, async_op=True)
+    
+    def wait_for_grad_sync(self):
+        if self.handle is not None:
+            self.handle.wait()
+
 class DDPWrapper(torch.nn.Module):
-    def __init__(self, module: torch.nn.Module):
+    def __init__(self, module: torch.nn.Module, bucket_size_byte: int = 4):
         super().__init__()
         self.module = module
         self.handles = []
+        self.buckets: list[ParamBucket] = []
+        self.param2Bucket = dict()
         
         def grad_hook(param):
             if param.grad is not None:
-                # Average gradients across workers
-                param.grad /= dist.get_world_size()
-                handle = dist.all_reduce(param.grad, op=dist.ReduceOp.SUM, async_op=True)
-                self.handles.append(handle)
+                bucket = self.param2Bucket[param]
+                bucket.handle_grad_hook(param)
             
         # Initialize parameters (broadcast from rank 0)
+        bucket = ParamBucket(bucket_size_byte)
+        self.buckets.append(bucket)
         for param in self.module.parameters():
             dist.broadcast(param.data, src=0, async_op=False)
             if param.requires_grad:
                 param.register_post_accumulate_grad_hook(grad_hook) 
-    
+                self.param2Bucket[param] = bucket
+                bucket.add_param(param)
+                if bucket.is_full():
+                    bucket = ParamBucket(bucket_size_byte)
+                    self.buckets.append(bucket)
+
+        if not bucket.is_empty():
+            self.buckets.append(bucket)
+
     def forward(self, *inputs, **kwargs):
+        for bucket in self.buckets:
+            bucket.prepare_back_prop()
         output = self.module(*inputs, **kwargs)
         # Synchronize buffers after forward
         for buffer in self.module.buffers():
@@ -77,8 +124,8 @@ class DDPWrapper(torch.nn.Module):
 
     def finish_gradient_synchronization(self):
         """Call after backward pass (or after gradient accumulation)."""
-        for handle in self.handles:
-            handle.wait()
+        for bucket in self.buckets:
+            bucket.wait_for_grad_sync()
 
 if __name__ == "__main__":
     world_size = 4
