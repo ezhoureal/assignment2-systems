@@ -152,44 +152,18 @@ class ShardedOptimizer(Optimizer):
         self.world_size = dist.get_world_size()
         
         # Convert input to list of groups
-        param_groups = self._param_groups(params)
         self.param2index: Dict[torch.Tensor, int] = {}
         self.all_params: List[torch.Tensor] = []
         self.param_count = 0
 
         # Process each group to assign ranks and collect all parameters
-        local_groups = []
-        for group in param_groups:
-            group_params = group['params']
-            local_group_params = []
-            for p in group_params:
-                idx = self.param_count
-                self.param2index[p] = idx
-                self.param_count += 1
-                rank = idx % self.world_size
-                self.all_params.append(p)
-                if rank == self.rank:
-                    local_group_params.append(p)
-            if local_group_params:
-                local_group = {k: v for k, v in group.items() if k != 'params'}
-                local_group['params'] = local_group_params
-                local_groups.append(local_group)
-
+        params = list(params)
+        local_params = self.split_params(params)
         # Initialize base Optimizer with local groups
-        super().__init__(local_groups, kwargs)
-        self.optim = optimizer_cls(local_groups, **kwargs)
+        super().__init__(local_params, kwargs)
+        self.optim = optimizer_cls(local_params, **kwargs)
         self.param_groups = self.optim.param_groups
         self.state = self.optim.state
-
-    def _param_groups(self, params: Any) -> List[Dict[str, Any]]:
-        if isinstance(params, torch.Tensor):
-            raise TypeError("params must be an iterable of Tensors or dicts")
-        param_groups: List[Dict[str, Any]] = list(params)
-        if not param_groups:
-            raise ValueError("optimizer got an empty parameter list")
-        if not isinstance(param_groups[0], dict):
-            param_groups = [{'params': param_groups}]
-        return param_groups
 
     def step(self, closure: Any = None, **kwargs: Any) -> Any:
         loss = self.optim.step(closure=closure, **kwargs) if closure else self.optim.step(**kwargs)
@@ -197,21 +171,10 @@ class ShardedOptimizer(Optimizer):
         for p in sorted_params:
             dist.broadcast(p.data, src=self.param2index[p] % self.world_size, async_op=False)
         return loss
-
-    def add_param_group(self, param_group: Dict[str, Any]) -> None:
-        if 'params' not in param_group:
-            raise ValueError("param group must contain 'params' key")
-        group_params = param_group['params']
-        if isinstance(group_params, torch.Tensor):
-            group_params = [group_params]
-        elif isinstance(group_params, set):
-            raise TypeError("parameters must be a list or iterable")
-        else:
-            group_params = list(group_params)
-        param_group['params'] = group_params
-
+    
+    def split_params(self, params: List) -> List[Any]:
         local_params = []
-        for p in group_params:
+        for p in params:
             if p in self.param2index:
                 continue
             idx = self.param_count
@@ -221,9 +184,13 @@ class ShardedOptimizer(Optimizer):
             self.all_params.append(p)
             if rank == self.rank:
                 local_params.append(p)
-        
+        return local_params
+
+    def add_param_group(self, param_group: Dict[str, Any]) -> None:
+        local_params = self.split_params(param_group["params"])
         if local_params:
-            local_group = {k: v for k, v in param_group.items() if k != 'params'}
-            local_group['params'] = local_params
-            self.optim.add_param_group(local_group)
+            param_group["params"] = local_params
+            # local_group = {k: v for k, v in param_group.items() if k != 'params'}
+            param_group['params'] = local_params
+            self.optim.add_param_group(param_group)
             self.param_groups = self.optim.param_groups
