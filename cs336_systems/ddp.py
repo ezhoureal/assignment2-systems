@@ -163,7 +163,6 @@ class ShardedOptimizer(Optimizer):
         super().__init__(local_params, kwargs)
         self.optim = optimizer_cls(local_params, **kwargs)
         self.param_groups = self.optim.param_groups
-        self.state = self.optim.state
 
     def step(self, closure: Any = None, **kwargs: Any) -> Any:
         loss = self.optim.step(closure=closure, **kwargs) if closure else self.optim.step(**kwargs)
@@ -189,8 +188,6 @@ class ShardedOptimizer(Optimizer):
     def add_param_group(self, param_group: Dict[str, Any]) -> None:
         local_params = self.split_params(param_group["params"])
         if local_params:
-            param_group["params"] = local_params
-            # local_group = {k: v for k, v in param_group.items() if k != 'params'}
             param_group['params'] = local_params
             self.optim.add_param_group(param_group)
             self.param_groups = self.optim.param_groups
